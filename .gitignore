@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+
+.env
+.env.*
+!.env.example
+
+env/
+.venv/
+
+checkpoints/
+dataframes/
+spark-warehouse/
