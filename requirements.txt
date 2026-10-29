@@ -6,3 +6,4 @@ requests==2.34.2
 urllib3==2.8.0
 pyspark==3.5.9
 psycopg2-binary==2.9.13
+boto3[crt]>=1.41.0
