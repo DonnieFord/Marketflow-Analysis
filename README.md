@@ -1,106 +1,131 @@
 # Marketflow Analysis
 
-A local cryptocurrency data pipeline that polls CoinGecko, publishes market snapshots to Kafka, processes them with Spark Structured Streaming, and stores calculated metrics in PostgreSQL.
+A local cryptocurrency data pipeline using Python, Kafka, Spark, PostgreSQL, and Apache Airflow. It polls CoinGecko, streams market snapshots into Parquet, calculates market metrics, and publishes metrics and rankings to PostgreSQL. Airflow schedules the analytics job every six minutes.
 
-## Pipeline
+## Architecture
 
 ```mermaid
 flowchart TD
-    A[CoinGecko REST API] --> B[Python producer]
-    B --> C[Kafka: crypto-prices]
+    A[CoinGecko API] --> B[Python producer]
+    B --> C[Kafka topic: crypto-prices]
     C --> D[Spark Structured Streaming]
-    D --> E[Parquet files]
+    D --> E[Local Parquet files]
     E --> F[Spark batch analytics]
+    H[Airflow in Ubuntu WSL2] --> I[Windows PowerShell launcher]
+    I --> F
     F --> G[PostgreSQL metrics and rankings]
 ```
 
-ZooKeeper supports the current Kafka setup. Ingestion is continuous; analytics runs as a separate repeating batch job. This project polls an API rather than consuming an exchange trade feed.
+ZooKeeper supports the current Kafka installation. The producer and streaming consumer run continuously and start manually. Airflow orchestrates the batch analytics step; it does not start Kafka or manage the ingestion services. This pipeline polls an API rather than consuming an exchange trade feed.
 
-## What it does
+## Features
 
-- Requests USD market data for up to 20 configured cryptocurrency IDs.
-- Publishes one JSON message containing a timestamp and an array of coin records per successful API request.
-- Parses and flattens Kafka messages into one row per coin observation.
-- Appends Parquet output with a 30-second processing trigger and a persistent streaming checkpoint.
-- Calculates price changes, moving averages, price volatility, and five-minute gainers/losers.
-- Upserts metrics using a PostgreSQL primary key on `(id, timestamp)` so overlapping runs do not create duplicate keys.
+- Poll USD market data for up to 20 configured cryptocurrency IDs.
+- Publish a timestamped JSON snapshot to Kafka after each successful API request.
+- Flatten each snapshot into coin observations and append Parquet output with streaming checkpoints.
+- Calculate one-minute and five-minute price changes, SMA, EMA, and price volatility.
+- Rank up to five gainers and five losers using each coin's newest observation.
+- Upsert main metrics on `(id, timestamp)` to avoid duplicate keys across overlapping runs.
+- Schedule analytics every six minutes with Airflow, one retry after two minutes, and at most one active DAG run.
+- Expose task status and execution logs in the Airflow dashboard.
+- Load a Windows-encrypted PostgreSQL credential from outside the repository.
 
-## Stack and files
-
-Python, Requests, kafka-python, Apache Kafka with ZooKeeper, PySpark, Parquet, PostgreSQL, psycopg2, and the PostgreSQL JDBC driver.
+## Project files
 
 | File or directory | Purpose |
 | --- | --- |
-| Producer script (use its actual filename) | Poll CoinGecko and publish Kafka messages |
-| `spark_streaming/kafka_streaming.py` | Read Kafka and write Parquet |
-| `spark_streaming/analytics.py` | Calculate metrics and write PostgreSQL tables |
-| `dataframes/` | Generated Parquet output and streaming sink metadata |
-| `checkpoints/` | Streaming recovery state |
+| `dags/crypto_dags.py` | CoinGecko producer; despite its directory/name, this is a long-running script, not an Airflow DAG |
+| `dags/marketflow_analytics_dags.py` | Airflow DAG definition for scheduled analytics |
+| `spark_streaming/kafka_streaming.py` | Kafka consumer that writes Parquet |
+| `spark_streaming/analytics.py` | One analytics run, PostgreSQL writes, then exit |
+| `Scripts/run_analytics.ps1` | Windows launcher that configures Java/Python and loads the saved credential |
+| `requirements.txt` | Windows pipeline Python dependency pins |
+| `dataframes/` | Generated Parquet output and sink metadata; excluded from Git |
+| `checkpoints/` | Streaming recovery state; excluded from Git |
 
-The producer filename and installed Kafka/Spark/Java versions still need to be recorded from the working environment.No Airflow orchestration is claimed here.
+Windows accepts `scripts` and `Scripts` interchangeably in paths. Use the actual `Scripts` folder casing when browsing the repository or accessing files through Linux.
 
 ## Data contract
 
-The producer calls `https://api.coingecko.com/api/v3/coins/markets` with `vs_currency=usd`. It requests ID, symbol, current price, market capitalization, total volume, 24-hour high/low, and source update time.
-
-Example message shape (illustrative values):
+The producer requests `https://api.coingecko.com/api/v3/coins/markets` with `vs_currency=usd`. A Kafka message contains a producer-local timestamp and an array of coin records:
 
 ```json
 {
-  "timestamp": "2026-10-26 11:00:00",
-  "data": [{
-    "id": "bitcoin",
-    "symbol": "btc",
-    "current_price": 80000.0,
-    "market_cap": 1600000000000,
-    "total_volume": 20000000000.0,
-    "high_24h": 81000.0,
-    "low_24h": 79000.0,
-    "last_updated": "2026-10-26T16:00:00Z"
-  }]
+  "timestamp": "2026-10-28 13:00:00",
+  "data": [
+    {
+      "id": "bitcoin",
+      "symbol": "btc",
+      "current_price": 80000.0,
+      "market_cap": 1600000000000,
+      "total_volume": 20000000000.0,
+      "high_24h": 81000.0,
+      "low_24h": 79000.0,
+      "last_updated": "2026-10-28T18:00:00Z"
+    }
+  ]
 }
 ```
 
-The producer sleeps 30 seconds after each request, so observations are typically more than 30 seconds apart. Requested IDs may return fewer than 20 coins. The payload timestamp is the producer machine's local time, not the source's `last_updated` time.
+Values above are illustrative. The producer sleeps 30 seconds after each request, so observations are usually more than 30 seconds apart. API responses can include fewer than 20 configured coins. The payload timestamp is local machine time, not the source's `last_updated` time.
 
-## Metrics
+## Metrics and tables
 
-| Metric | Definition |
+| Output | Definition |
 | --- | --- |
-| `change_1min` | Percentage change from the most recent available price at or before 60 seconds earlier |
-| `change_5min` | Percentage change from the most recent available price at or before 300 seconds earlier |
-| `SMA` | Simple average of the current and previous four observations; fewer observations are used during warm-up |
-| `EMA` | Observation-based EMA with span 3 and alpha 0.5; seeded with the first valid price in the loaded history |
-| `volatility` | Sample standard deviation of the current and previous four prices, in price units; not return volatility |
-| Gainers | Up to five latest coin observations with positive rounded `change_5min`, descending, then ID ascending |
-| Losers | Up to five latest coin observations with negative rounded `change_5min`, ascending, then ID ascending |
+| `change_1min` | Percentage change from the latest available price at or before 60 seconds earlier |
+| `change_5min` | Percentage change from the latest available price at or before 300 seconds earlier |
+| `SMA` | Mean of the current and previous four observations; fewer during warm-up |
+| `EMA` | Span-three, observation-based EMA with alpha 0.5, seeded from the first valid price in the loaded history |
+| `volatility` | Sample standard deviation of the current and previous four prices, in price units |
+| Gainers | Latest coin observations with positive rounded five-minute change, sorted descending, then ID ascending |
+| Losers | Latest coin observations with negative rounded five-minute change, sorted ascending, then ID ascending |
 
-Changes are rounded to two decimal places before ranking. Missing, zero, and rounded-to-zero changes do not qualify. Rankings may contain fewer than five rows. They currently store rank, ID, and symbol only.
+Changes are rounded to two decimal places before ranking. Null and rounded-to-zero changes do not qualify. Rankings may contain fewer than five rows and store rank, ID, and symbol.
 
-Analytics loads the last 13 minutes, computes metrics, then keeps the last seven minutes for writing. It sleeps six minutes after each run; processing time adds to that interval. Initial startup may not have enough history for five-minute changes.
+Analytics loads 13 minutes of input history, calculates metrics, then retains seven minutes of output. Airflow replaces the former in-script countdown; the script now runs once and exits. A guard raises an error if the seven-minute output is empty after calculation. The earlier branch for no input in the initial 13-minute window currently prints a message and exits successfully without writes.
 
-## Setup
+| PostgreSQL table | Write behavior |
+| --- | --- |
+| `public.crypto_table_v2` | Upsert on `(id, timestamp)` |
+| `top_5_gainers` | JDBC overwrite per completed analytics run |
+| `top_5_losers` | JDBC overwrite per completed analytics run |
 
-Use the existing working Windows/PowerShell environment. Record its versions before attempting to reproduce it elsewhere:
+The original `crypto_table` is legacy data. Current main-metric writes target `crypto_table_v2`.
 
-```powershell
-.\env\Scripts\python.exe --version
-.\env\Scripts\python.exe -m pip show pyspark kafka-python requests psycopg2-binary
-java -version
-spark-submit --version
-```
+## Environment and prerequisites
 
-Create a virtual environment if needed and install the Python dependencies using a PySpark version compatible with the selected Spark installation. Do not blindly upgrade the working Spark/Java combination. Exact dependency pins are pending environment export.
+This is a local Windows/WSL2 development setup:
+
+- Windows pipeline virtual environment: Python 3.11.9 and PySpark 3.5.9.
+- PostgreSQL on Windows: `localhost:5432`, database `crypto_metrics`, role `postgres`.
+- Kafka on Windows: `localhost:9092`, topic `crypto-prices`, with ZooKeeper.
+- Analytics PostgreSQL JDBC package: `org.postgresql:postgresql:42.7.4`.
+- Launcher Java path in the tested setup: `C:\Program Files\Microsoft\jdk-21.0.12.101-hotspot`.
+- Airflow 3.3.2 in Ubuntu under WSL2, using Python 3.14.4 and a separate `~/airflow-venv` environment.
+- Airflow standalone for local learning/development; Docker Desktop is not required by this configuration.
+
+These versions describe the tested local environment, not a guarantee of compatibility on every machine. The installed Kafka/Scala versions and exact streaming connector command still need recording. Spark/Java compatibility should be verified before reproducing this setup; do not blindly upgrade the working environment.
+
+The laptop used during development reported about 3.4 GB usable RAM. Resource contention and an earlier API connection failure were observed; the cause of that failure was not established. Scheduled runs later completed successfully. Close unused applications when running the full stack.
+
+### Windows Python setup
+
+From the project root, if creating a new environment:
 
 ```powershell
 python -m venv env
 .\env\Scripts\Activate.ps1
-python -m pip install requests kafka-python psycopg2-binary
+python -m pip install -r requirements.txt
 ```
 
-The producer needs outbound HTTPS access to CoinGecko. Kafka listens at `localhost:9092`; PostgreSQL uses `localhost:5432`, database `crypto_metrics`.
+Kafka, Java, PostgreSQL, and the Spark Kafka connector require separate setup. Airflow belongs in its Ubuntu environment, not the Windows pipeline environment.
 
-Create `crypto_metrics` using pgAdmin, connect its Query Tool, and create the main table if it does not exist:
+Update absolute Parquet/checkpoint paths in the Spark scripts and Windows/WSL paths in the DAG for your machine. The committed launcher also contains a machine-specific Java path. Preserve checkpoints when resuming the same stream.
+
+### PostgreSQL schema
+
+Create `crypto_metrics` in pgAdmin, connect the Query Tool to it, then run:
 
 ```sql
 CREATE TABLE IF NOT EXISTS public.crypto_table_v2 (
@@ -117,17 +142,52 @@ CREATE TABLE IF NOT EXISTS public.crypto_table_v2 (
 );
 ```
 
-Analytics creates/replaces `top_5_gainers` and `top_5_losers` through JDBC. The current local configuration uses the `postgres` role. The original `crypto_table` is legacy data; new main-metric writes target `crypto_table_v2` explicitly.
+The analytics job creates/replaces the ranking tables through JDBC.
 
-Update both Spark scripts' Parquet paths, and the streaming checkpoint path, for your machine. Current code uses absolute Windows file URIs. Preserve a working checkpoint when resuming the same stream.
+### Save the database credential once
 
-## Run locally
+Run these commands in **Windows PowerShell**, one at a time. Enter the PostgreSQL password only at the hidden prompt:
 
-Open the project root in VS Code. Keep each long-running service in a separate terminal. Start PostgreSQL, then ZooKeeper, Kafka, the producer, Spark streaming, and analytics.
+```powershell
+New-Item -ItemType Directory -Force -Path "$env:LOCALAPPDATA\Marketflow" | Out-Null
+$cryptoSecret = Read-Host "PostgreSQL password" -AsSecureString
+$databaseCredential = [System.Management.Automation.PSCredential]::new("postgres", $cryptoSecret)
+$databaseCredential | Export-Clixml "$env:LOCALAPPDATA\Marketflow\postgres.xml"
+Remove-Variable databaseCredential, cryptoSecret
+```
 
-### 1. ZooKeeper and Kafka
+On Windows, the saved credential is encrypted for the same Windows account and computer. The launcher imports it, supplies the password through `CRYPTO_DB_PASSWORD` to the Spark process, and propagates Spark's exit code. The file stays outside the repository. Repeat credential setup after a password change or when moving to another account/computer.
 
-Use the startup commands from your installed ZooKeeper-based Kafka distribution. Typical Windows commands, run from that distribution's root in separate terminals, are:
+### Airflow setup in Ubuntu
+
+Enter Ubuntu from PowerShell with `wsl -d Ubuntu`. For a fresh Ubuntu setup:
+
+```bash
+sudo apt update
+sudo apt install -y python3-venv python3-pip
+python3 -m venv ~/airflow-venv
+source ~/airflow-venv/bin/activate
+python -m pip install "apache-airflow==3.3.2" --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-3.3.2/constraints-3.14.txt"
+```
+
+The constraints above match Python 3.14. Use constraints matching your Python version if it differs.
+
+Install only the actual Airflow DAG into Airflow's DAG directory. From the project root in Ubuntu:
+
+```bash
+mkdir -p ~/airflow/dags
+cp dags/marketflow_analytics_dags.py ~/airflow/dags/
+```
+
+Do not copy or point Airflow at the whole project `dags` folder: `crypto_dags.py` runs the continuous producer at module level. After editing the Airflow DAG, copy the updated file again.
+
+## Start the pipeline
+
+Keep each long-running service in a separate terminal. PostgreSQL must be running.
+
+### 1. ZooKeeper and Kafka — Windows
+
+From your ZooKeeper-based Kafka distribution directory, in separate PowerShell terminals:
 
 ```powershell
 .\bin\windows\zookeeper-server-start.bat .\config\zookeeper.properties
@@ -137,54 +197,77 @@ Use the startup commands from your installed ZooKeeper-based Kafka distribution.
 .\bin\windows\kafka-server-start.bat .\config\server.properties
 ```
 
-These commands apply to distributions containing those files; they are not KRaft setup instructions. If needed, create the topic from the Kafka directory:
+These apply only to distributions containing those files, not KRaft installations. If needed:
 
 ```powershell
 .\bin\windows\kafka-topics.bat --bootstrap-server localhost:9092 --create --if-not-exists --topic crypto-prices --partitions 1 --replication-factor 1
 ```
 
-### 2. Producer
+### 2. Producer — Windows
 
-Activate the environment and run the producer using its actual relative path:
+From the project root:
 
 ```powershell
-.\env\Scripts\Activate.ps1
-python ".\dags\crypto_dags.py"
+.\env\Scripts\python.exe .\dags\crypto_dags.py
 ```
 
-`PATH_TO_PRODUCER.py` is a placeholder. Successful requests print the number of coin records queued for Kafka.
+Successful requests print the number of coin records queued for Kafka.
 
-### 3. Spark streaming
+### 3. Streaming consumer — Windows
 
-Use the existing working `spark-submit` command for `spark_streaming/kafka_streaming.py`. It must include the Spark SQL Kafka connector matching your Spark and Scala versions. The exact connector coordinate is intentionally not guessed here.
+Use the existing working `spark-submit` command for `spark_streaming/kafka_streaming.py`, including the Kafka connector matching your installed Spark and Scala versions. That exact connector coordinate has not yet been documented here.
 
-If Spark's Windows launcher cannot locate Python, set these in that terminal from the project root:
+Set Python paths in that terminal if required:
 
 ```powershell
 $env:PYSPARK_PYTHON = "$PWD\env\Scripts\python.exe"
 $env:PYSPARK_DRIVER_PYTHON = "$PWD\env\Scripts\python.exe"
 ```
 
-A streaming process normally stays active. Monitor completed batch IDs and Kafka input-message counts; one Kafka message can contain multiple coin rows. Parquet results are written to disk, not printed as a live table.
+The streaming process stays active and writes Parquet. Allow at least six minutes of fresh observations for a five-minute comparison; source cadence and gaps can require longer.
 
-### 4. Analytics
+### 4. Airflow — Ubuntu
 
-In its own terminal, set the Python paths above if required. Supply the database password through a hidden prompt:
-
-```powershell
-$cryptoSecret = Read-Host "PostgreSQL password" -AsSecureString
-$env:CRYPTO_DB_PASSWORD = ([System.Net.NetworkCredential]::new("", $cryptoSecret)).Password
-Remove-Variable cryptoSecret
-spark-submit --packages org.postgresql:postgresql:42.7.4 ".\spark_streaming\analytics.py"
+```bash
+source ~/airflow-venv/bin/activate
+airflow standalone
 ```
 
-The code must import `os` and use `os.environ["CRYPTO_DB_PASSWORD"]` in `db_properties`. Repeat the prompt in a new terminal. Save edits with Ctrl+S and restart analytics after code or credential changes; a running process does not reload the script.
+Leave this terminal running and open `http://localhost:8080` in the Windows browser. Use the Airflow-generated credentials, not the Ubuntu or PostgreSQL password. If needed, retrieve them privately in another Ubuntu terminal:
 
-Success messages include `Main metrics saved to crypto_table_v2.` and `Data written to PostgreSQL (all 3 tables).` The countdown then indicates the next batch run. Use Ctrl+C in the appropriate terminal to stop a process.
+```bash
+cat ~/airflow/simple_auth_manager_passwords.json.generated
+```
+
+Search for `marketflow_analytics` in the dashboard. The DAG is paused on first creation. Trigger one manual run, inspect `run_spark_analytics` logs, and confirm database writes. Then unpause it to enable the six-minute schedule. Verify a run with **Run Type: Scheduled** and **State: Success**.
+
+Airflow launches Windows PowerShell through WSL interoperability. The PowerShell script then runs Windows Spark against Windows paths and localhost PostgreSQL. Spark and psycopg2 do not need to be installed inside Airflow's Python environment for this arrangement.
+
+The Windows VS Code interpreter may underline Airflow imports because Airflow is installed in Ubuntu. Run/import the DAG in the Ubuntu Airflow environment; the VS Code Windows “Run Python File” button is not how this DAG is executed.
+
+### Optional: run analytics manually — Windows
+
+From the project root:
+
+```powershell
+powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\Scripts\run_analytics.ps1
+$LASTEXITCODE
+```
+
+Do not launch manual analytics concurrently with the scheduled job. Expected log messages are `Main metrics saved to crypto_table_v2.` and `Data written to PostgreSQL (all 3 tables).`; also verify nonempty results and fresh database timestamps. Exit code zero alone does not prove records were processed.
+
+## Stop and restart
+
+1. Pause `marketflow_analytics` in the Airflow dashboard to prevent new scheduled runs.
+2. Let any active analytics run finish.
+3. Stop Airflow, the producer, and streaming consumer with Ctrl+C in their respective terminals.
+4. Stop Kafka, then ZooKeeper. Answer `Y` if Windows asks to terminate the batch job.
+
+Pausing does not cancel an active run. After a computer restart, start the services again, collect fresh data, start Airflow, and unpause the DAG when ready. Scheduling only runs while Airflow and the required local services are running; this is not an always-on deployment.
 
 ## Validation
 
-Run these separately in the `crypto_metrics` Query Tool:
+In the `crypto_metrics` Query Tool:
 
 ```sql
 SELECT "timestamp", id, price, change_1min, change_5min, "SMA", "EMA"
@@ -202,31 +285,40 @@ HAVING COUNT(*) > 1;
 ```
 
 ```sql
-SELECT * FROM top_5_gainers ORDER BY rank;
-SELECT * FROM top_5_losers ORDER BY rank;
+SELECT * FROM public.top_5_gainers ORDER BY rank;
+SELECT * FROM public.top_5_losers ORDER BY rank;
 ```
 
-The duplicate check should return zero rows. For consecutive observations from the same analytics calculation, verify `EMA_current = 0.5 * price_current + 0.5 * EMA_previous`, allowing floating-point tolerance.
+The duplicate check should return zero rows. Within one calculation's consecutive observations, check `EMA_current = 0.5 * price_current + 0.5 * EMA_previous`, allowing floating-point tolerance.
 
-Manual checks completed during development: advancing streaming batches, successful writes to all three tables, no duplicate keys in the new metrics table, and sample SMA/EMA arithmetic. These are local observations, not an automated test suite or a production reliability guarantee.
+Development checks completed locally:
 
-## Limitations and next improvements
+- Advancing streaming batches and successful writes to the three PostgreSQL tables.
+- Duplicate-key query and sample SMA/EMA arithmetic checks.
+- One-shot analytics launcher and loading the encrypted credential without a terminal-provided password.
+- Ubuntu-to-Windows launcher execution with exit code zero.
+- Successful Airflow manual execution with database-write logs.
+- Two successful scheduled Airflow runs observed in the dashboard.
 
-- Producer `send()` is asynchronous: its print message means queued, not confirmed delivery. Delivery acknowledgments and retries need explicit handling.
-- HTTP errors are printed, but request exceptions currently stop the producer. Add retry/backoff and response validation.
-- Polling can retrieve unchanged source prices. Requested IDs should be checked against current API responses.
-- Local timestamps lack timezone information. Normalize event times to UTC and retain source timestamps for freshness checks.
-- Lookbacks have no maximum staleness bound; gaps can make reference prices older than the nominal interval.
-- The EMA is re-seeded from each run's 13-minute input. It is a finite-history approximation to a persistent full-history EMA.
-- The 13-minute lookback covers normal overlapping runs, but long outages can leave historical gaps. Add explicit backfill and data-quality checks.
-- Metrics are upserted row by row from Spark to the driver, appropriate for this small local dataset. Scale with staged batch writes and a database merge.
-- Main metrics and the two ranking tables are separate transactions. Ranking overwrite can replace tables and their metadata; publication is not atomic across all three tables.
-- Old rows in `crypto_table` retain legacy calculations; they are not automatically repaired or migrated.
-- Absolute paths, repeated Parquet scans, and many small files need improvement for larger deployments.
+These are manual development checks, not an automated test suite or a production reliability guarantee.
 
-## Before publishing
+## Known limitations and next improvements
 
-Keep passwords, API keys, virtual environments, generated Parquet files, and checkpoints out of source control. Suggested `.gitignore` entries:
+- The API producer uses asynchronous Kafka `send()`: its message means queued, not confirmed delivery. Add acknowledgment handling, request retries/backoff, and response validation.
+- Source prices can remain unchanged across polls. Check requested coin IDs against API responses.
+- Timestamps are timezone-naive local times. Normalize to UTC and retain source freshness timestamps.
+- Lookbacks have no maximum staleness bound. Gaps can select older reference prices than the nominal interval.
+- EMA is re-seeded from each run's 13-minute history, approximating a persistent full-history EMA.
+- Long outages are not backfilled. A no-input 13-minute branch still exits successfully; improve explicit no-data status handling.
+- Main metric upserts and ranking overwrites are separate transactions. Ranking overwrites can replace metadata; publication across all tables is not atomic.
+- Row-by-row driver-side upserts suit this small dataset; larger deployments need staged/batched database writes.
+- Absolute paths, small Parquet files, and repeated scans limit portability and scalability.
+- Spark logs a Windows temporary JDBC JAR deletion error during shutdown. Observed runs still completed writes and returned exit code zero. Investigate cleanup and Spark/Java compatibility rather than treating every shutdown stack trace as an analytics failure.
+- Airflow standalone and this WSL-to-Windows launcher are for local development. Ingestion startup remains manual; cloud deployment and Databricks are not implemented.
+
+## Source control
+
+Keep credentials, generated datasets, checkpoints, virtual environments, and runtime logs out of Git. Relevant ignore entries:
 
 ```gitignore
 env/
@@ -241,4 +333,6 @@ checkpoints/
 spark-warehouse/
 ```
 
-Ignoring a file does not remove previously committed content. Review Git history for secrets and rotate any exposed credentials. Add the actual producer filename, exact working startup commands, version pins, and a fresh-clone run check before presenting this as fully reproducible.
+Airflow's runtime state lives under Ubuntu `~/airflow`; only the DAG source belongs in this repository. The encrypted credential lives under Windows `%LOCALAPPDATA%\Marketflow`, outside the repository. Ignoring a file does not remove it from existing Git history.
+
+Reproducibility work remaining: record the exact Kafka/Scala versions and streaming connector command, remove machine-specific paths, and validate setup from a fresh clone.

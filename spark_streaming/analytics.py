@@ -32,7 +32,7 @@ db_properties = {
 }
 
 
-while True:
+if __name__ == "__main__":
     try:
         print("\n=== Running Spark Job ===")
 
@@ -171,6 +171,12 @@ while True:
             F.current_timestamp() - F.expr("INTERVAL 7 MINUTES")
             )
             latest_data = latest_data.cache()
+            if latest_data.isEmpty():
+                raise RuntimeError(
+                    "No records remain in the 7-minute output window. "
+                    "Check that the producer and streaming consumer are running."
+                )
+
             # Keep only the newest record for each cryptocurrency
             latest_coin_window = Window.partitionBy("id").orderBy(
             col("timestamp").desc()
@@ -296,17 +302,6 @@ while True:
     except Exception as e:
         print(f"Error in Spark job: {e}")
         traceback.print_exc()
-
-    # Wait 6 minutes before the next run
-    total_seconds = 360
-    print("Waiting for next run:")
-
-    for remaining in range(total_seconds, 0, -1):
-        mins, secs = divmod(remaining, 60)
-        print(
-            f"\rNext run in {mins:02}:{secs:02}",
-            end=""
-        )
-        time.sleep(1)
-
-    print("\n")
+        raise
+    finally:
+        spark.stop()
